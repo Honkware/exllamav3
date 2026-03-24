@@ -7,7 +7,13 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
+try:
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
+except ImportError:
+    HAS_FLASH_ATTN = False
+    flash_attn_func = flash_attn_with_kvcache = flash_attn_varlen_func = None
+else:
+    HAS_FLASH_ATTN = True
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
@@ -112,6 +118,9 @@ def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     Add attn parameters to state
     """
     attn_mode = params.get("attn_mode", "flash_attn_nc")
+    if not HAS_FLASH_ATTN and attn_mode in ("flash_attn", "flash_attn_nc"):
+        attn_mode = "sdpa_nc"
+        params["attn_mode"] = "sdpa_nc"
     match attn_mode:
         case "sdpa_nc":
             return prepare_sdpa_nc(input_ids, params)
@@ -545,7 +554,7 @@ class Attention(Module):
         o = o.transpose(1, 2)
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -559,6 +568,8 @@ class Attention(Module):
         seqlen: int,
         params: dict,
     ):
+        if not HAS_FLASH_ATTN:
+            return self.decode_sdpa_nc(x, bsz, seqlen, params)
         causal = params.get("causal", True)
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
@@ -620,7 +631,7 @@ class Attention(Module):
             )
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -634,6 +645,8 @@ class Attention(Module):
         seqlen: int,
         params: dict,
     ):
+        if not HAS_FLASH_ATTN:
+            raise RuntimeError("flash_attn is required for flash_attn mode")
         cache = params.get("cache")
         block_table = get_for_device(params, "block_table", self.device)
         cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
@@ -697,7 +710,7 @@ class Attention(Module):
             cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
