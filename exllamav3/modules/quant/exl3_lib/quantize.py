@@ -635,7 +635,10 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         else:
             H /= count
             diag_mean = torch.diag(H).mean()
-            q_fallback = diag_mean.item() < 1e-20
+            dm = diag_mean.item()
+            # A non-finite diagonal (NaN/Inf from a dead/degenerate channel) passes
+            # the < 1e-20 test and crashes the Cholesky below; fall back instead.
+            q_fallback = dm < 1e-20 or not math.isfinite(dm)
 
         # Regularize diagonal
         H.diagonal().add_(quant_args.get("sigma_reg", 0.025) * diag_mean)
