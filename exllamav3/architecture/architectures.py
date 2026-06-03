@@ -21,6 +21,7 @@ from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
 from .lfm2_moe import Lfm2MoeModel
 from .llama import LlamaModel
+from .locateanything import LocateAnythingTextModel
 from .mellum import MellumModel
 from .mimo import MiMoModel
 from .minimax_m2 import MiniMaxM2Model
@@ -76,6 +77,7 @@ ARCHITECTURES = {
         IQuestCoderModel,
         Lfm2MoeModel,
         LlamaModel,
+        LocateAnythingTextModel,
         MellumModel,
         MiMoModel,
         MiniMaxM2Model,

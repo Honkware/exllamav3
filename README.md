@@ -40,6 +40,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **IQuest-Coder** (IQuestCoderForCausalLM)
 - **LFM 2.5** (Lfm2MoeForCausalLM)
 - **Llama**, **Llama 2**, **Llama 3**, **Llama 3.1-Nemotron** etc. (LlamaForCausalLM)
+- **LocateAnything 3B** (LocateAnythingForConditionalGeneration) *- text LLM quantized, vision tower copied unquantized*
 - **Mellum 2** (MellumForCausalLM)
 - **MiMo-RL** (MiMoForCausalLM)
 - **MiniMax-M2** (MiniMaxM2ForCausalLM)
