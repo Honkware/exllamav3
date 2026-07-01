@@ -4,6 +4,7 @@ from .apertus import ApertusModel
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
+from .deepseek_v3 import DeepseekV3Model
 from .dflash import DFlashModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
@@ -29,6 +30,7 @@ from .mixtral import MixtralModel
 from .nanochat import NanoChatModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
+from .openpangu_v2 import OpenPanguV2Model
 from .phi3 import Phi3Model
 from .qwen2 import Qwen2Model
 from .qwen2_5_vl import Qwen2_5VLModel
@@ -55,6 +57,7 @@ ARCHITECTURES = {
         CohereModel,
         Cohere2Model,
         DeciLMModel,
+        DeepseekV3Model,
         DFlashModel,
         Dots1Model,
         Ernie4_5Model,
@@ -81,6 +84,7 @@ ARCHITECTURES = {
         NanoChatModel,
         Olmo3Model,
         OlmoHybridModel,
+        OpenPanguV2Model,
         Phi3Model,
         Qwen2Model,
         Qwen2_5VLModel,
