@@ -150,7 +150,9 @@ def diff(name, a, b, results):
 
 
 @torch.inference_mode()
-def run_test(model_dir, ref_path, device = "cuda:0"):
+def run_test(model_dir, ref_path, device = "cuda:0", ref_dir = None):
+    # ref_dir: read the torch reference from a different (unquantized) copy,
+    # for round-trip testing of a converted model_dir
     sys.path.insert(0, os.path.dirname(os.path.abspath(ref_path)))
     ref_mod = __import__(os.path.basename(ref_path).replace(".py", ""))
 
@@ -159,7 +161,7 @@ def run_test(model_dir, ref_path, device = "cuda:0"):
     model = Model.from_config(config)
     model.load()
 
-    ref = ref_mod.PanguTorchCalibModel(model_dir, full_layer = True)
+    ref = ref_mod.PanguTorchCalibModel(ref_dir or model_dir, full_layer = True)
     T = 24
     torch.manual_seed(11)
     ids = torch.randint(0, CFG["vocab_size"], (1, T))
@@ -264,10 +266,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default = "/tmp/pangu_synth")
     ap.add_argument("--ref", default = "/tmp/_pangu_torch_calib.py")
+    ap.add_argument("--ref-dir", default = None)
     ap.add_argument("--gen", action = "store_true")
     ap.add_argument("--run", action = "store_true")
     args = ap.parse_args()
     if args.gen:
         gen_checkpoint(args.dir)
     if args.run:
-        run_test(args.dir, args.ref)
+        run_test(args.dir, args.ref, ref_dir = args.ref_dir)
