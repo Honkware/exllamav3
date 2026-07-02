@@ -5,6 +5,7 @@ from ..model.config import Config, no_default
 from ..model.model import Model
 from ..modules import RMSNorm, Embedding, GatedMLP, BlockSparseMLP, Linear
 from ..modules.arch_specific.pangu_v2 import PanguAttention, PanguDecoderBlock, PanguMHC
+from .openpangu_v2_mtp import OpenPanguV2MTPModel
 from ..modules.attn import prepare_for_attn
 
 # openPangu-2.0 (DeepSeek-lineage MoE with MLA, mHC 4-stream residual, MoME convs,
@@ -22,7 +23,7 @@ class OpenPanguV2Config(Config):
     ):
         super().__init__(
             directory,
-            {"text": OpenPanguV2Model},
+            {"text": OpenPanguV2Model, "mtp": OpenPanguV2MTPModel},
             **kwargs
         )
 
@@ -75,6 +76,11 @@ class OpenPanguV2Config(Config):
         self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
 
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
+
+        # MTP depth heads (layers 46..48), loadable as draft components
+        self.num_nextn_predict_layers = self.read_cfg(int, "num_nextn_predict_layers", 0)
+        if self.num_nextn_predict_layers == 0:
+            del self.model_classes["mtp"]
 
 
 class OpenPanguV2Model(Model):

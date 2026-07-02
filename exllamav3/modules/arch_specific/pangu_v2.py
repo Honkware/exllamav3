@@ -113,7 +113,13 @@ class PanguMHC(Module):
         assert self.pre_only
         bsz, seqlen, _ = x.shape
         hidden, _, _ = self.mhc_pre(x.view(bsz * seqlen, self.num_stream, self.hidden_size))
-        return hidden.view(bsz, seqlen, self.hidden_size).half()
+        hidden = hidden.view(bsz, seqlen, self.hidden_size).half()
+        if params.get("export_state_merge"):
+            s = params.get("export_states")
+            if not s:
+                s = params["export_states"] = []
+            s.append(hidden)
+        return hidden
 
 
 def _mome_conv(x, weight, kernel_width):
