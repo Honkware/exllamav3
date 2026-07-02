@@ -131,7 +131,9 @@ def _mome_conv(x, weight, kernel_width):
     conv = F.conv1d(padded, weight, groups = weight.shape[0]).squeeze(0).transpose(0, 1)
     if kernel_width > 1:
         conv[: kernel_width - 1] = 0
-    return (conv + seq).to(dtype)
+    # contiguous: the transpose view otherwise reaches the EXL3 projections,
+    # whose kernels assume row-major input (fp16 F.linear tolerates strides)
+    return (conv + seq).to(dtype).contiguous()
 
 
 class PanguAttention(MLAAttention):
