@@ -8,6 +8,24 @@ from ...modules import Module, Linear, RMSNorm, GatedMLP, BlockSparseMLP
 from ..mla_attn import MLAAttention, _rms_std, _rms_kvc, _rotate_half
 from ...util.tensor import get_for_device
 
+try:
+    import triton
+    import triton.language as tl
+    has_triton = True
+except ImportError:
+    has_triton = False
+
+    class _DummyTritonLanguage:
+        constexpr = object()
+
+    class _DummyTriton:
+        @staticmethod
+        def jit(fn):
+            return fn
+
+    triton = _DummyTriton()
+    tl = _DummyTritonLanguage()
+
 # openPangu-2.0 (openpangu_v2) building blocks. Forward math mirrors Huawei's
 # pure-torch reference (_pangu_torch_calib.py) exactly. The MLA core lives in
 # modules/mla_attn.py; this file adds what is openPangu's own: MoME convs,
@@ -79,7 +97,8 @@ def _mhc(fn, *args):
     # reverts to eager for the rest of the process.
     global _mhc_fns
     if _mhc_fns is None:
-        if os.environ.get("EXLLAMA_PANGU_NO_COMPILE", None):
+        if os.environ.get("EXLLAMA_PANGU_NO_COMPILE", None) or \
+           os.environ.get("EXLLAMA_PANGU_MHC", None) == "eager":
             _mhc_fns = {f: f for f in _mhc_pure}
         else:
             try:
@@ -94,6 +113,155 @@ def _mhc(fn, *args):
     except Exception:
         _mhc_fns = {f: f for f in _mhc_pure}
         return fn(*args)
+
+
+# Hand Triton path: one launch per mHC phase (pre, sinkhorn+post) instead of
+# inductor's per-op kernels; 92 applications per token keep batch-1 decode
+# launch-bound either way. One program per row: the N*H-wide norm/GEMV loops
+# in BLK tiles holding all P partial dots in registers, the NxN sinkhorn
+# iterates fully in registers. rstd is applied to the accumulated dots
+# rather than per element (fp32 reduction reorder, same class as inductor's
+# RMS reorder); gate and sinkhorn op sequences match the pure fns exactly.
+
+@triton.jit
+def _mhc_pre_kernel(
+    x, phi, gamma, alpha, beta, hidden, h_post, h_res,
+    eps, hc_eps, a_stride, H,
+    N: tl.constexpr, P: tl.constexpr, P_PAD: tl.constexpr,
+    MERGE: tl.constexpr, BLK: tl.constexpr, BLK_H: tl.constexpr,
+):
+    # H runtime so the tile loops stay scf.for instead of an 80-way unroll
+    row = tl.program_id(0).to(tl.int64)
+    NH = N * H
+    x_row = x + row * NH
+    p_offs = tl.arange(0, P_PAD)
+    p_mask = p_offs < P
+
+    ssq = tl.zeros([BLK], dtype = tl.float32)
+    acc = tl.zeros([P_PAD], dtype = tl.float32)
+    for start in range(0, NH, BLK):
+        offs = start + tl.arange(0, BLK)
+        m = offs < NH
+        xv = tl.load(x_row + offs, mask = m, other = 0.0).to(tl.float32)
+        gv = tl.load(gamma + offs, mask = m, other = 0.0).to(tl.float32)
+        pv = tl.load(phi + p_offs[:, None] * NH + offs[None, :],
+                     mask = p_mask[:, None] & m[None, :], other = 0.0).to(tl.float32)
+        ssq += xv * xv
+        acc += tl.sum(pv * (xv * gv)[None, :], axis = 1)
+
+    rstd = tl.math.rsqrt(tl.sum(ssq) / NH + eps)
+    mixes = acc * rstd
+
+    bv = tl.load(beta + p_offs, mask = p_mask, other = 0.0).to(tl.float32)
+    if MERGE:
+        # a_stride 0 broadcasts a scalar branch_alpha_pre
+        av = tl.load(alpha + p_offs * a_stride, mask = p_mask, other = 0.0).to(tl.float32)
+    else:
+        a_pre = tl.load(alpha).to(tl.float32)
+        a_post = tl.load(alpha + 1).to(tl.float32)
+        a_res = tl.load(alpha + 2).to(tl.float32)
+        av = tl.where(p_offs < N, a_pre, tl.where(p_offs < 2 * N, a_post, a_res))
+    lin = mixes * av + bv
+    sig = tl.sigmoid(lin)
+    if not MERGE:
+        tl.store(h_post + row * N + (p_offs - N), 2.0 * sig,
+                 mask = (p_offs >= N) & (p_offs < 2 * N))
+        tl.store(h_res + row * N * N + (p_offs - 2 * N), lin,
+                 mask = (p_offs >= 2 * N) & p_mask)
+
+    i_n = tl.arange(0, N)
+    h_pre = tl.sum(tl.where(p_offs[None, :] == i_n[:, None], sig[None, :] + hc_eps, 0.0), axis = 1)
+    for start in range(0, H, BLK_H):
+        offs = start + tl.arange(0, BLK_H)
+        m = offs < H
+        xt = tl.load(x_row + i_n[:, None] * H + offs[None, :],
+                     mask = m[None, :], other = 0.0).to(tl.float32)
+        hv = tl.sum(h_pre[:, None] * xt, axis = 0)
+        tl.store(hidden + row * H + offs, hv.to(hidden.dtype.element_ty), mask = m)
+
+
+@triton.jit
+def _mhc_sinkhorn_post_kernel(
+    y, h_post, residual, h_res, out,
+    hc_eps, recur, H,
+    N: tl.constexpr, BLK_H: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    i_n = tl.arange(0, N)
+    r = tl.load(h_res + row * N * N + i_n[:, None] * N + i_n[None, :]).to(tl.float32)
+    e = tl.exp(r - tl.max(r, axis = 1)[:, None])
+    r = e / tl.sum(e, axis = 1)[:, None] + hc_eps
+    r = r / (tl.sum(r, axis = 0)[None, :] + hc_eps)
+    for i in range(recur):
+        r = r / (tl.sum(r, axis = 1)[:, None] + hc_eps)
+        r = r / (tl.sum(r, axis = 0)[None, :] + hc_eps)
+
+    hp = tl.load(h_post + row * N + i_n).to(tl.float32)
+    y_row = y + row * H
+    res_row = residual + row * N * H
+    out_row = out + row * N * H
+    for start in range(0, H, BLK_H):
+        offs = start + tl.arange(0, BLK_H)
+        m = offs < H
+        yv = tl.load(y_row + offs, mask = m, other = 0.0).to(tl.float32)
+        rv = tl.load(res_row + i_n[:, None] * H + offs[None, :],
+                     mask = m[None, :], other = 0.0).to(tl.float32)
+        # out[i, j] = h_post[i] * y[j] + sum_k r[k, i] * res[k, j] (dim -3 sum)
+        ov = hp[:, None] * yv[None, :] + tl.sum(r[:, :, None] * rv[:, None, :], axis = 0)
+        tl.store(out_row + i_n[:, None] * H + offs[None, :],
+                 ov.to(out.dtype.element_ty), mask = m[None, :])
+
+
+def _mhc_pre_tr(x, phi, norm_gamma, alpha, beta, eps, hc_eps, n, h, merge):
+    rows = x.numel() // (n * h)
+    x = x.contiguous()
+    a = alpha.reshape(-1).contiguous()
+    b = beta.reshape(-1).contiguous()
+    hidden = torch.empty(rows, h, dtype = x.dtype, device = x.device)
+    if merge:
+        h_post = h_res = None
+        hp = hr = hidden  # dummy ptrs, dead under MERGE
+    else:
+        hp = h_post = torch.empty(rows, n, dtype = torch.float, device = x.device)
+        hr = h_res = torch.empty(rows, n, n, dtype = torch.float, device = x.device)
+    _mhc_pre_kernel[(rows,)](
+        x, phi.contiguous(), norm_gamma.contiguous(), a, b, hidden, hp, hr,
+        eps, hc_eps, 1 if a.numel() > 1 else 0, h,
+        N = n, P = phi.shape[0], P_PAD = triton.next_power_of_2(phi.shape[0]),
+        MERGE = merge, BLK = 256, BLK_H = 1024,
+        num_warps = 8,
+    )
+    return hidden, h_post, h_res
+
+
+def _mhc_sinkhorn_post_tr(x, h_post, residual, h_res, recur_norm, hc_eps, n, h):
+    rows = x.numel() // h
+    x = x.contiguous()
+    out = torch.empty(rows, n, h, dtype = x.dtype, device = x.device)
+    _mhc_sinkhorn_post_kernel[(rows,)](
+        x, h_post.contiguous(), residual.contiguous(), h_res.contiguous(), out,
+        hc_eps, max(recur_norm - 1, 0), h,
+        N = n, BLK_H = 512,
+        num_warps = 4,
+    )
+    return out
+
+
+_mhc_tr = None
+
+def _mhc_use_triton():
+    # Default backend when triton imports and a CUDA device is present;
+    # EXLLAMA_PANGU_MHC in {"triton", "compile", "eager"} overrides. A kernel
+    # failure downgrades to compile-then-eager for the rest of the process.
+    global _mhc_tr
+    if _mhc_tr is None:
+        mode = os.environ.get("EXLLAMA_PANGU_MHC", "triton")
+        _mhc_tr = mode == "triton" and has_triton and torch.cuda.is_available()
+    return _mhc_tr
+
+def _mhc_no_triton():
+    global _mhc_tr
+    _mhc_tr = False
 
 
 class PanguMHC(Module):
@@ -154,6 +322,12 @@ class PanguMHC(Module):
 
     def mhc_pre(self, x):
         # x: [tok, N, H] -> collapsed [tok, H] (+ post/res gates on the full path)
+        if _mhc_use_triton():
+            try:
+                return _mhc_pre_tr(x, self.phi, self.norm_gamma, self.alpha, self.beta,
+                                   self.eps, self.hc_eps, self.num_stream, self.hidden_size, self.pre_only)
+            except Exception:
+                _mhc_no_triton()
         if self.pre_only:
             hidden = _mhc(_mhc_pre_merge, x, self.phi, self.norm_gamma, self.alpha, self.beta,
                           self.eps, self.hc_eps, self.num_stream, self.hidden_size)
@@ -170,6 +344,12 @@ class PanguMHC(Module):
 
     def mhc_finish(self, x, h_post, residual, h_res):
         # fused sinkhorn + post
+        if _mhc_use_triton():
+            try:
+                return _mhc_sinkhorn_post_tr(x, h_post, residual, h_res,
+                                             self.recur_norm, self.hc_eps, self.num_stream, self.hidden_size)
+            except Exception:
+                _mhc_no_triton()
         return _mhc(_mhc_sinkhorn_post, x, h_post, residual, h_res,
                     self.recur_norm, self.hc_eps, self.num_stream, self.hidden_size)
 
