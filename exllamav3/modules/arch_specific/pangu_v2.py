@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 from ...model.config import Config
@@ -12,6 +13,80 @@ from ...util.tensor import get_for_device
 # modules/mla_attn.py; this file adds what is openPangu's own: MoME convs,
 # learned sinks, the (Phase-2) DSA indexer, the mHC multi-stream residual and
 # its decoder block. Phase 1: dense DSA, full-sequence forward, batch 1.
+
+
+# mHC math as module-level pure fns so torch.compile can fuse each chain of
+# tiny fp32 eager ops into a few kernels: 92 applications per token at batch-1
+# decode are pure launch overhead otherwise. Op order matches the eager code
+# exactly (fp32 throughout, same eps placement).
+
+def _mhc_pre_merge(x, phi, norm_gamma, alpha, beta, eps, hc_eps, n, h):
+    # x: [tok, N, H] -> collapsed [tok, H] (model-tail merge)
+    flat = x.reshape(-1, n * h).float()
+    normed = flat * torch.rsqrt(flat.square().mean(-1, keepdim = True) + eps)
+    mixes = F.linear(normed * norm_gamma, phi)
+    h_pre = torch.sigmoid(mixes * alpha + beta.view(1, n)) + hc_eps
+    return torch.sum(h_pre.view(-1, n, 1) * x.float(), dim = 1).to(x.dtype)
+
+
+def _mhc_pre(x, phi, norm_gamma, alpha, beta, eps, hc_eps, n, h):
+    # x: [tok, N, H] -> collapsed [tok, H] + post/res gates
+    flat = x.reshape(-1, n * h).float()
+    normed = flat * torch.rsqrt(flat.square().mean(-1, keepdim = True) + eps)
+    mixes = F.linear(normed * norm_gamma, phi)
+    h_pre, h_post, h_res = mixes.split([n, n, n * n], dim = -1)
+    a_pre, a_post, a_res = alpha.view(-1).split([1, 1, 1])
+    b_pre, b_post, b_res = beta.view(-1).split([n, n, n * n])
+    h_pre = torch.sigmoid(h_pre * a_pre + b_pre) + hc_eps
+    h_post = 2 * torch.sigmoid(h_post * a_post + b_post)
+    h_res = h_res.view(-1, n, n) * a_res + b_res.view(n, n)
+    hidden = torch.sum(h_pre.view(-1, n, 1) * x.float(), dim = 1)
+    return hidden.to(x.dtype), h_post, h_res
+
+
+def _mhc_sinkhorn(h_res, recur_norm, hc_eps):
+    h_res = h_res.float().softmax(-1) + hc_eps
+    h_res = h_res / (h_res.sum(-2, keepdim = True) + hc_eps)
+    for _ in range(max(recur_norm - 1, 0)):
+        h_res = h_res / (h_res.sum(-1, keepdim = True) + hc_eps)
+        h_res = h_res / (h_res.sum(-2, keepdim = True) + hc_eps)
+    return h_res
+
+
+def _mhc_post(x, h_post, residual, h_res, n, h):
+    # x: [tok, H] sublayer output, residual: [tok, N, H] -> [tok, N, H]
+    residual = residual.view(-1, n, h)
+    hidden = (
+        h_post.float().unsqueeze(-1) * x.float().unsqueeze(-2)
+        + torch.sum(h_res.float().unsqueeze(-1) * residual.float().unsqueeze(-2), dim = -3)
+    )
+    return hidden.to(x.dtype)
+
+
+_mhc_pure = (_mhc_pre_merge, _mhc_pre, _mhc_sinkhorn, _mhc_post)
+_mhc_fns = None
+
+def _mhc(fn, *args):
+    # Compile lazily on first call, dynamic = True so decode and prefill shapes
+    # share graphs. EXLLAMA_PANGU_NO_COMPILE=1 or any compile/runtime failure
+    # reverts to eager for the rest of the process.
+    global _mhc_fns
+    if _mhc_fns is None:
+        if os.environ.get("EXLLAMA_PANGU_NO_COMPILE", None):
+            _mhc_fns = {f: f for f in _mhc_pure}
+        else:
+            try:
+                _mhc_fns = {f: torch.compile(f, dynamic = True) for f in _mhc_pure}
+            except Exception:
+                _mhc_fns = {f: f for f in _mhc_pure}
+    g = _mhc_fns[fn]
+    if g is fn:
+        return fn(*args)
+    try:
+        return g(*args)
+    except Exception:
+        _mhc_fns = {f: f for f in _mhc_pure}
+        return fn(*args)
 
 
 class PanguMHC(Module):
@@ -72,42 +147,19 @@ class PanguMHC(Module):
 
     def mhc_pre(self, x):
         # x: [tok, N, H] -> collapsed [tok, H] (+ post/res gates on the full path)
-        n, h = self.num_stream, self.hidden_size
-        dtype = x.dtype
-        flat = x.reshape(-1, n * h).float()
-        normed = flat * torch.rsqrt(flat.square().mean(-1, keepdim = True) + self.eps)
-        mixes = F.linear(normed * self.norm_gamma, self.phi)
         if self.pre_only:
-            h_pre = torch.sigmoid(mixes * self.alpha + self.beta.view(1, n)) + self.hc_eps
-            hidden = torch.sum(h_pre.view(-1, n, 1) * x.float(), dim = 1)
-            return hidden.to(dtype), None, None
-        h_pre, h_post, h_res = mixes.split([n, n, n * n], dim = -1)
-        a_pre, a_post, a_res = self.alpha.view(-1).split([1, 1, 1])
-        b_pre, b_post, b_res = self.beta.view(-1).split([n, n, n * n])
-        h_pre = torch.sigmoid(h_pre * a_pre + b_pre) + self.hc_eps
-        h_post = 2 * torch.sigmoid(h_post * a_post + b_post)
-        h_res = h_res.view(-1, n, n) * a_res + b_res.view(n, n)
-        hidden = torch.sum(h_pre.view(-1, n, 1) * x.float(), dim = 1)
-        return hidden.to(dtype), h_post, h_res
+            hidden = _mhc(_mhc_pre_merge, x, self.phi, self.norm_gamma, self.alpha, self.beta,
+                          self.eps, self.hc_eps, self.num_stream, self.hidden_size)
+            return hidden, None, None
+        return _mhc(_mhc_pre, x, self.phi, self.norm_gamma, self.alpha, self.beta,
+                    self.eps, self.hc_eps, self.num_stream, self.hidden_size)
 
     def mhc_sinkhorn(self, h_res):
-        h_res = h_res.float().softmax(-1) + self.hc_eps
-        h_res = h_res / (h_res.sum(-2, keepdim = True) + self.hc_eps)
-        for _ in range(max(self.recur_norm - 1, 0)):
-            h_res = h_res / (h_res.sum(-1, keepdim = True) + self.hc_eps)
-            h_res = h_res / (h_res.sum(-2, keepdim = True) + self.hc_eps)
-        return h_res
+        return _mhc(_mhc_sinkhorn, h_res, self.recur_norm, self.hc_eps)
 
     def mhc_post(self, x, h_post, residual, h_res):
         # x: [tok, H] sublayer output, residual: [tok, N, H] -> [tok, N, H]
-        n, h = self.num_stream, self.hidden_size
-        dtype = x.dtype
-        residual = residual.view(-1, n, h)
-        hidden = (
-            h_post.float().unsqueeze(-1) * x.float().unsqueeze(-2)
-            + torch.sum(h_res.float().unsqueeze(-1) * residual.float().unsqueeze(-2), dim = -3)
-        )
-        return hidden.to(dtype)
+        return _mhc(_mhc_post, x, h_post, residual, h_res, self.num_stream, self.hidden_size)
 
     def forward(self, x, params, out_dtype = None):
         # Merge module (model tail): collapse [b, s, N*H] -> [b, s, H]
@@ -135,6 +187,25 @@ def _mome_conv(x, weight, kernel_width):
     # contiguous: the transpose view otherwise reaches the EXL3 projections,
     # whose kernels assume row-major input (fp16 F.linear tolerates strides)
     return (conv + seq).to(dtype).contiguous()
+
+
+_CONV_SLOTS = 1024
+
+def _mome_conv_batched(x, prev, weight, kernel_width, pos):
+    # Ring flavor of _mome_conv: x [bsz, q_len, dim], prev [bsz, k-1, dim] the
+    # last k-1 pre-conv inputs per row (right-aligned), pos [bsz] tokens already
+    # seen. The prev rows complete every window so no padding; conv contributions
+    # at absolute positions < k-1 are dropped through where() (fresh-sequence
+    # zeroing), which is also what masks windows reaching into prev rows not yet
+    # written for short sequences
+    k = kernel_width
+    dtype = x.dtype
+    seq = torch.cat((prev, x), dim = 1)
+    f = seq.float()
+    conv = F.conv1d(f.transpose(1, 2), weight, groups = weight.shape[0]).transpose(1, 2)
+    apos = pos.unsqueeze(1) + torch.arange(x.shape[1], device = x.device).unsqueeze(0)
+    conv = torch.where((apos >= k - 1).unsqueeze(-1), conv, 0.)
+    return (conv + f[:, k - 1:]).to(dtype).contiguous(), seq[:, -(k - 1):]
 
 
 class PanguAttention(MLAAttention):
@@ -181,10 +252,17 @@ class PanguAttention(MLAAttention):
         self.conv_qa = None
         self.conv_ckv = None
         self.conv_o = None
-        # Paged decode state: up-projected sink K/V (built once per load) and
-        # per-sequence conv tails keyed by (site, first cache page)
+        # Paged decode state: up-projected sink K/V (built once per load), rope
+        # tables built once to model max, per-site conv tail slot buffers, and
+        # the page -> slot map, mirrored host-side (dict) and device-side
+        # (table) so the decode path never reads it back
         self._sink_cache = None
+        self._rope_max = min(config.max_position_embeddings, 131072)
         self._conv_state = {}
+        self._slot_map = {}
+        self._slot_page = [None] * _CONV_SLOTS
+        self._slot_rr = 0
+        self._page2slot = None
 
     @override
     def load_extra(self, device, get):
@@ -206,6 +284,10 @@ class PanguAttention(MLAAttention):
         self.conv_qa = self.conv_ckv = self.conv_o = None
         self._sink_cache = None
         self._conv_state = {}
+        self._slot_map = {}
+        self._slot_page = [None] * _CONV_SLOTS
+        self._slot_rr = 0
+        self._page2slot = None
 
     @override
     def get_tensors_extra(self):
@@ -250,23 +332,53 @@ class PanguAttention(MLAAttention):
                                 v.transpose(0, 1).contiguous().float())
         return self._sink_cache
 
+    def _conv_slot(self, page, device):
+        # Slow path only. Round-robin slot reuse: a live sequence can only be
+        # evicted past _CONV_SLOTS concurrent sequences. Newly assigned slots
+        # are zeroed; a restart on an already mapped page keeps its slot, the
+        # position mask covers the stale tail
+        if page in self._slot_map:
+            return
+        s = self._slot_rr
+        self._slot_rr = (s + 1) % _CONV_SLOTS
+        old = self._slot_page[s]
+        if old is not None:
+            del self._slot_map[old]
+        self._slot_page[s] = page
+        self._slot_map[page] = s
+        for st in self._conv_state.values():
+            st[s].zero_()
+        t = self._page2slot
+        if t is None or page >= t.shape[0]:
+            n = max(page + 1, 2 * t.shape[0] if t is not None else 4096)
+            t2 = torch.zeros(n, device = device, dtype = torch.long)
+            if t is not None:
+                t2[: t.shape[0]] = t
+            self._page2slot = t = t2
+        t[page] = s
+
     def _conv_ring(self, site, x, weight, params):
         # Causal conv over [bsz, q_len, dim] with per-sequence tail state so
         # decode steps see the previous kernel_width - 1 pre-conv latents.
-        # cache_seqlens == 0 restarts the sequence
+        # Sequences are keyed by their first cache page and enter through
+        # cache_seqlens == 0, which restarts the row and maps its slot
+        # host-side; past that the path is batched device ops, no host syncs
         k = self.mome_kernel
-        bt = params["block_table"]
-        seqlens = params["cache_seqlens"]
-        out = torch.empty_like(x)
-        for b in range(x.shape[0]):
-            key = (site, int(bt[b, 0]))
-            prev = self._conv_state.get(key) if int(seqlens[b]) > 0 else None
-            seq = torch.cat((prev, x[b]), dim = 0) if prev is not None else x[b]
-            y = _mome_conv(seq, weight, k)
-            out[b] = y[seq.shape[0] - x.shape[1]:]
-            self._conv_state[key] = seq[-(k - 1):].clone()
-        if len(self._conv_state) > 4096:
-            self._conv_state.clear()
+        state = self._conv_state.get(site)
+        if state is None:
+            state = torch.zeros(_CONV_SLOTS, k - 1, x.shape[-1], device = x.device, dtype = x.dtype)
+            self._conv_state[site] = state
+        seqlens_h = params["cache_seqlens"]  # host tensor from the generator
+        if (seqlens_h == 0).any():
+            bt_h = params["block_table"]
+            for b in range(x.shape[0]):
+                self._conv_slot(int(bt_h[b, 0]), x.device)
+        bt = get_for_device(params, "block_table", x.device)
+        seqlens = get_for_device(params, "cache_seqlens", x.device)
+        slots = self._page2slot.index_select(0, bt[:, 0].long())
+        prev = state.index_select(0, slots)
+        out, tail = _mome_conv_batched(x, prev, weight, k, seqlens)
+        state.index_copy_(0, slots, tail)
         return out
 
     @override
@@ -299,8 +411,9 @@ class PanguAttention(MLAAttention):
 
         cache_seqlens = get_for_device(params, "cache_seqlens", x.device)
         block_table = get_for_device(params, "block_table", x.device)
-        max_pos = int(cache_seqlens.max().item()) + q_len
-        cos, sin = self._cos_sin(max_pos, x.device, q_pe.dtype)
+        # rope tables build once to model max, then indexing by pos keeps the
+        # decode step free of host syncs
+        cos, sin = self._cos_sin(self._rope_max, x.device, q_pe.dtype)
         pos = cache_seqlens.long().unsqueeze(1) + torch.arange(q_len, device = x.device).unsqueeze(0)
         cos_q = cos[pos].unsqueeze(2)
         sin_q = sin[pos].unsqueeze(2)
