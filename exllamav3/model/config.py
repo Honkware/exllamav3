@@ -53,7 +53,7 @@ class Config(ABC):
         self.architecture = arch
 
         # Collect all .safetensors files in directory
-        self.stc = SafetensorsCollection(directory, load_method = kwargs.get("load_method"))
+        self.stc = SafetensorsCollection(directory, kwargs.get("load_method"), self.get_tensor_name_fixes())
 
         # Standard params, vocab
         self.bos_token_id = self.read_cfg(int, ["bos_token_id", "text_config->bos_token_id"], None)
@@ -96,6 +96,10 @@ class Config(ABC):
             self.layer_map_str = None
 
 
+    def get_tensor_name_fixes(self):
+        return {}
+
+
     def default_max_position_embeddings(self):
         return 8192
 
@@ -133,6 +137,7 @@ class Config(ABC):
 
 
     @staticmethod
+    # def from_directory(directory: str, arch_override: str | None = None, **kwargs) -> Config:
     def from_directory(directory: str, **kwargs) -> Config:
         """
         Create config from the specified directory if it contains a HF model of a supported architecture
@@ -163,6 +168,7 @@ class Config(ABC):
 
         arch_def = architectures[arch]
         config_class = arch_def["config_class"]
+        # config = config_class(directory, arch_override = arch_override, **kwargs)
         config = config_class(directory, **kwargs)
         return config
 
