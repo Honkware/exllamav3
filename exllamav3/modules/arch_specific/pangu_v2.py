@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from ...model.config import Config
 from ...modules import Module, Linear, RMSNorm, GatedMLP, BlockSparseMLP
 from ..mla_attn import MLAAttention, _rms_std, _rms_kvc, _rotate_half
-from ..util.tensor import get_for_device
+from ...util.tensor import get_for_device
 
 # openPangu-2.0 (openpangu_v2) building blocks. Forward math mirrors Huawei's
 # pure-torch reference (_pangu_torch_calib.py) exactly. The MLA core lives in
