@@ -63,9 +63,11 @@ class OpenPanguV2MTPModel(Model):
             idx = config.num_hidden_layers + depth
             key = f"model.layers.{idx}"
 
+            # module key must differ from the block's: the convert stage saves
+            # per-module tensor files named by key, and identical keys clobber
             input_layer = PanguMTPInputLayer(
                 config = config,
-                key = key,
+                key = f"{key}.mtp_in",
                 key_norm_hidden = f"{key}.hnorm",
                 key_norm_embedding = f"{key}.enorm",
                 key_proj = f"{key}.eh_proj",
