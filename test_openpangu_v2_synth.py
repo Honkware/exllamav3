@@ -57,6 +57,7 @@ CFG = {
     "index_n_heads": 2,
     "index_head_dim": 64,
     "torch_dtype": "float16",
+    "num_nextn_predict_layers": 2,
     "bos_token_id": 1,
     "eos_token_id": 2,
 }
@@ -126,6 +127,37 @@ def gen_checkpoint(model_dir):
                 for sk in ("gate_proj", "up_proj", "down_proj"):
                     io = (H, CFG["moe_intermediate_size"]) if sk == "down_proj" else (CFG["moe_intermediate_size"], H)
                     lin(f"{p}.mlp.experts.{e}.{sk}.weight", *io)
+
+    # MTP depth heads: fusion + one pangu block + own head norm per depth.
+    # Tied embed/head are absent, matching the borrow-at-attach design
+    for d in range(CFG["num_nextn_predict_layers"]):
+        p = f"model.layers.{CFG['num_hidden_layers'] + d}"
+        vec(f"{p}.hnorm.weight", H)
+        vec(f"{p}.enorm.weight", H)
+        lin(f"{p}.eh_proj.weight", H, 2 * H)
+        vec(f"{p}.shared_head.norm.weight", H)
+        for nk in ("input_layernorm", "post_attention_layernorm", "pre_mlp_layernorm", "post_mlp_layernorm"):
+            vec(f"{p}.{nk}.weight", H)
+        lin(f"{p}.self_attn.q_a_proj.weight", CFG["q_lora_rank"], H)
+        vec(f"{p}.self_attn.q_a_layernorm.weight", CFG["q_lora_rank"])
+        lin(f"{p}.self_attn.q_b_proj.weight", heads * qkh, CFG["q_lora_rank"])
+        lin(f"{p}.self_attn.kv_a_proj_with_mqa.weight", CFG["kv_lora_rank"] + CFG["qk_rope_head_dim"], H)
+        vec(f"{p}.self_attn.kv_a_layernorm.weight", CFG["kv_lora_rank"])
+        lin(f"{p}.self_attn.kv_b_proj.weight", heads * (CFG["qk_nope_head_dim"] + CFG["v_head_dim"]), CFG["kv_lora_rank"])
+        lin(f"{p}.self_attn.o_proj.weight", H, heads * CFG["v_head_dim"])
+        t[f"{p}.self_attn.param_sink_compressed_kv"] = (torch.randn(CFG["param_sink_number"], CFG["kv_lora_rank"]) * 0.5).half()
+        t[f"{p}.self_attn.param_sink_k_pe"] = (torch.randn(CFG["param_sink_number"], CFG["qk_rope_head_dim"]) * 0.5).half()
+        for ck, dd in (("qa_conv", CFG["q_lora_rank"]), ("compresskv_conv", CFG["kv_lora_rank"]), ("o_conv", heads * CFG["v_head_dim"])):
+            t[f"{p}.self_attn.{ck}.weight"] = (torch.randn(dd, 1, CFG["router_sliding_window"]) * 0.1).half()
+        lin(f"{p}.mlp.gate.weight", CFG["n_routed_experts"], H)
+        t[f"{p}.mlp.e_score_correction_bias"] = (torch.randn(CFG["n_routed_experts"]) * 0.01).half()
+        for sk in ("gate_proj", "up_proj", "down_proj"):
+            io = (H, CFG["moe_intermediate_size"]) if sk == "down_proj" else (CFG["moe_intermediate_size"], H)
+            lin(f"{p}.mlp.shared_experts.{sk}.weight", *io)
+        for e in range(CFG["n_routed_experts"]):
+            for sk in ("gate_proj", "up_proj", "down_proj"):
+                io = (H, CFG["moe_intermediate_size"]) if sk == "down_proj" else (CFG["moe_intermediate_size"], H)
+                lin(f"{p}.mlp.experts.{e}.{sk}.weight", *io)
 
     save_file(t, os.path.join(model_dir, "model.safetensors"))
     index = {"metadata": {"total_size": sum(v.numel() * 2 for v in t.values())},
@@ -260,6 +292,33 @@ def run_test(model_dir, ref_path, device = "cuda:0", ref_dir = None):
         print(f"{name:26s} {mad:10.6f} {rel:10.6f}  {extra}{flag}")
         worst = max(worst, rel)
     print(f"\nWORST rel diff: {worst:.6f}  ({'PASS' if worst <= 3e-2 else 'FAIL'} @ 3e-2)")
+
+    # MTP component round-trip: the load itself is the gate (missing tensors
+    # from convert-stage clobbering crash here); values reported vs ref_dir
+    if "mtp" in config.model_classes:
+        def load_mtp(d):
+            cfg = Config.from_directory(d)
+            trunk = Model.from_config(cfg)
+            trunk.modules[0].load(torch.device("cpu"))
+            comp = Model.from_config(cfg, component = "mtp")
+            comp.attach_to(trunk)
+            for mod in comp.modules:
+                mod.load(torch.device(device))
+            return comp
+        torch.manual_seed(17)
+        mtp_ids = torch.randint(0, CFG["vocab_size"], (1, 8))
+        th = (torch.randn(1, 8, CFG["hidden_size"]) * 0.5).half().to(device)
+        comp_a = load_mtp(model_dir)
+        comp_b = load_mtp(ref_dir) if ref_dir else None
+        for step in range(comp_a.num_depths):
+            xa = comp_a.forward(mtp_ids, {"target_hidden": th, "mtp_step": step})
+            assert torch.isfinite(xa).all(), f"mtp depth {step} non-finite"
+            if comp_b is not None:
+                xb = comp_b.forward(mtp_ids, {"target_hidden": th, "mtp_step": step})
+                c = torch.nn.functional.cosine_similarity(
+                    xa.float().flatten(), xb.float().flatten(), dim = 0).item()
+                print(f"MTP depth {step} round-trip cos {c:.6f}")
+        print("MTP LOAD OK")
 
 
 if __name__ == "__main__":
