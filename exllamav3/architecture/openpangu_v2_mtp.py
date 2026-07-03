@@ -183,16 +183,30 @@ class OpenPanguV2MTPModel(Model):
 
     @override
     def prefill(self, input_ids: torch.Tensor, params: dict | None = None):
-        # Refresh depth-0's cache for accepted positions. Deeper heads keep
-        # their drafting-time states; unwritten positions read back as zeros
+        # Chain the span through every depth: depth k consumes depth k-1's
+        # output states with ids shifted one further, densely seeding each
+        # depth's cache (prompt prefill and accepted spans alike). Positions
+        # reuse the same base offset; the one-slot semantic skew per depth is
+        # part of the approximate draft-cache doctrine
         if params is None:
             params = {}
-        x = self.prepare_inputs(input_ids, params)
-        a, b = self.depth_slices[0]
-        for module in self.modules[a: b]:
-            params["layer_instance"] = 0
-            x = module.prepare_for_device(x, params)
-            x = module.forward(x, params)
+        th = params.get("target_hidden")
+        ids = input_ids
+        for d in range(self.num_depths):
+            if ids.shape[-1] == 0:
+                break
+            p = dict(params)
+            p["target_hidden"] = th
+            x = self.prepare_inputs(ids, p)
+            a, b = self.depth_slices[d]
+            for module in self.modules[a: b]:
+                p["layer_instance"] = 0
+                x = module.prepare_for_device(x, p)
+                x = module.forward(x, p)
+            if x.shape[1] <= 1:
+                break
+            th = x[:, :-1, :]
+            ids = ids[:, 1:]
 
 
     def attach_to(self, target):
