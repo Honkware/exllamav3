@@ -63,7 +63,14 @@ def _mhc_post(x, h_post, residual, h_res, n, h):
     return hidden.to(x.dtype)
 
 
-_mhc_pure = (_mhc_pre_merge, _mhc_pre, _mhc_sinkhorn, _mhc_post)
+def _mhc_sinkhorn_post(x, h_post, residual, h_res, recur_norm, hc_eps, n, h):
+    # sinkhorn and the post mix run back to back after the sublayer; fusing
+    # them into one graph halves the per-application launch boundaries
+    h_res = _mhc_sinkhorn(h_res, recur_norm, hc_eps)
+    return _mhc_post(x, h_post, residual, h_res, n, h)
+
+
+_mhc_pure = (_mhc_pre_merge, _mhc_pre, _mhc_sinkhorn, _mhc_post, _mhc_sinkhorn_post)
 _mhc_fns = None
 
 def _mhc(fn, *args):
@@ -160,6 +167,11 @@ class PanguMHC(Module):
     def mhc_post(self, x, h_post, residual, h_res):
         # x: [tok, H] sublayer output, residual: [tok, N, H] -> [tok, N, H]
         return _mhc(_mhc_post, x, h_post, residual, h_res, self.num_stream, self.hidden_size)
+
+    def mhc_finish(self, x, h_post, residual, h_res):
+        # fused sinkhorn + post
+        return _mhc(_mhc_sinkhorn_post, x, h_post, residual, h_res,
+                    self.recur_norm, self.hc_eps, self.num_stream, self.hidden_size)
 
     def forward(self, x, params, out_dtype = None):
         # Merge module (model tail): collapse [b, s, N*H] -> [b, s, H]
@@ -526,8 +538,7 @@ class PanguDecoderBlock(Module):
         else:
             y = self.attn.forward(y, params)
         y = self.post_attn_norm.forward(y, params, out_dtype = torch.half)
-        h_res = self.attn_mhc.mhc_sinkhorn(h_res)
-        x = self.attn_mhc.mhc_post(y, h_post, residual, h_res)
+        x = self.attn_mhc.mhc_finish(y, h_post, residual, h_res)
 
         residual = x
         y, h_post, h_res = self.mlp_mhc.mhc_pre(x)
@@ -536,8 +547,7 @@ class PanguDecoderBlock(Module):
         if y.dtype != torch.half:
             y = y.half()
         y = self.post_mlp_norm.forward(y.reshape(bsz * seq_len, h), params, out_dtype = torch.half)
-        h_res = self.mlp_mhc.mhc_sinkhorn(h_res)
-        x = self.mlp_mhc.mhc_post(y, h_post, residual, h_res)
+        x = self.mlp_mhc.mhc_finish(y, h_post, residual, h_res)
 
         if self.block_post_norm is not None:
             x = self.block_post_norm.forward(x.reshape(bsz * seq_len, n * h), params, out_dtype = torch.half)
