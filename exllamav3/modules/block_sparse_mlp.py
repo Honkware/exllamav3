@@ -80,6 +80,19 @@ def routing_std(bsz, cfg, y, params):
 
 # TODO: Optimize top_k groups (for DS3)
 def routing_ds3(bsz, cfg, y, params):
+    # group masking is identity with one group, same math as the dots kernel
+    if bsz == 1 and cfg.n_group == 1 and not params.get("activate_all_experts"):
+        ext.routing_ds3_nogroup(
+            y,
+            cfg.gate_tensor,
+            cfg.router_logits_bsz1,
+            cfg.e_score_correction_bias,
+            cfg.selected_experts_bsz1,
+            cfg.routing_weights_bsz1,
+            cfg.routed_scaling_factor
+        )
+        return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+
     activate_all_experts = params.get("activate_all_experts")
     router_logits = torch.matmul(y, cfg.gate_tensor)
 

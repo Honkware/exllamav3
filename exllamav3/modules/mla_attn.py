@@ -296,7 +296,10 @@ class MLAAttention(Module):
 
         cache_seqlens = get_for_device(params, "cache_seqlens", x.device)
         block_table = get_for_device(params, "block_table", x.device)
-        max_pos = int(cache_seqlens.max().item()) + q_len
+        # rope tables sized from the cache, not cache_seqlens.max(): that
+        # .item() is a per-layer device sync and breaks graph capture
+        cache = params.get("cache")
+        max_pos = getattr(cache, "max_num_tokens", None) or (int(cache_seqlens.max().item()) + q_len)
         cos, sin = self._cos_sin(max_pos, x.device, q_pe.dtype)
         pos = cache_seqlens.long().unsqueeze(1) + torch.arange(q_len, device = x.device).unsqueeze(0)
         cos_q = cos[pos].unsqueeze(2)
