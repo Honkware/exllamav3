@@ -30,6 +30,7 @@ from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
 from .nanochat import NanoChatModel
 from .olmo3 import Olmo3Model
+from .openpangu_v2 import OpenPanguV2Model
 from .olmohybrid import OlmoHybridModel
 from .phi3 import Phi3Model
 from .qwen2 import Qwen2Model
@@ -86,6 +87,7 @@ ARCHITECTURES = {
         MixtralModel,
         NanoChatModel,
         Olmo3Model,
+        OpenPanguV2Model,
         OlmoHybridModel,
         Phi3Model,
         Qwen2Model,
