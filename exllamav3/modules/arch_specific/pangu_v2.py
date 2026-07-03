@@ -380,8 +380,13 @@ class PanguAttention(MLAAttention):
         if state is None:
             state = torch.zeros(_CONV_SLOTS, k - 1, x.shape[-1], device = x.device, dtype = x.dtype)
             self._conv_state[site] = state
-        seqlens_h = params["cache_seqlens"]  # host tensor from the generator
-        if (seqlens_h == 0).any():
+        # conv_fresh = False lets a graph-capture driver assert no row restarts
+        # this call, keeping the host-side check off the captured path
+        fresh = params.get("conv_fresh")
+        if fresh is None:
+            seqlens_h = params["cache_seqlens"]  # host tensor from the generator
+            fresh = bool((seqlens_h == 0).any())
+        if fresh:
             bt_h = params["block_table"]
             for b in range(x.shape[0]):
                 self._conv_slot(int(bt_h[b, 0]), x.device)
