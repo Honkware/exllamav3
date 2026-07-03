@@ -4,7 +4,8 @@ import torch
 import torch.nn.functional as F
 from ...model.config import Config
 from ...modules import Module, Linear, RMSNorm, GatedMLP, BlockSparseMLP
-from ..mla_attn import MLAAttention, _rms_std
+from ..mla_attn import MLAAttention, _rms_std, _rms_kvc, _rotate_half
+from ..util.tensor import get_for_device
 
 # openPangu-2.0 (openpangu_v2) building blocks. Forward math mirrors Huawei's
 # pure-torch reference (_pangu_torch_calib.py) exactly. The MLA core lives in
@@ -180,6 +181,10 @@ class PanguAttention(MLAAttention):
         self.conv_qa = None
         self.conv_ckv = None
         self.conv_o = None
+        # Paged decode state: up-projected sink K/V (built once per load) and
+        # per-sequence conv tails keyed by (site, first cache page)
+        self._sink_cache = None
+        self._conv_state = {}
 
     @override
     def load_extra(self, device, get):
@@ -199,6 +204,8 @@ class PanguAttention(MLAAttention):
         self.idx_k_norm_w = None
         self.sink_ckv = self.sink_kpe = None
         self.conv_qa = self.conv_ckv = self.conv_o = None
+        self._sink_cache = None
+        self._conv_state = {}
 
     @override
     def get_tensors_extra(self):
@@ -227,6 +234,126 @@ class PanguAttention(MLAAttention):
         return _mome_conv(attn, self.conv_o, self.mome_kernel) if self.use_mome else attn
 
     @override
+    def _sink_kv(self):
+        # Sink K/V in cache layout ([heads, sinks, qk], V zero-padded), built
+        # once per load. Sinks carry their learned rope part unrotated.
+        if self._sink_cache is None:
+            nope, v_dim = self.qk_nope_head_dim, self.v_head_dim
+            lat_n = _rms_std(self.sink_ckv, self.kv_a_norm_w, self.rms_norm_eps)
+            kv = self.kv_b_proj.forward(lat_n.unsqueeze(0), {})[0][..., : self.num_heads * (nope + v_dim)]
+            kv = kv.view(self.sink_count, self.num_heads, nope + v_dim)
+            k_nope, v = torch.split(kv, [nope, v_dim], dim = -1)
+            k_pe = self.sink_kpe.to(k_nope.dtype).unsqueeze(1).expand(-1, self.num_heads, -1)
+            k = torch.cat((k_nope, k_pe), dim = -1)
+            v = F.pad(v, (0, self.qk_head_dim - v_dim))
+            self._sink_cache = (k.transpose(0, 1).contiguous().float(),
+                                v.transpose(0, 1).contiguous().float())
+        return self._sink_cache
+
+    def _conv_ring(self, site, x, weight, params):
+        # Causal conv over [bsz, q_len, dim] with per-sequence tail state so
+        # decode steps see the previous kernel_width - 1 pre-conv latents.
+        # cache_seqlens == 0 restarts the sequence
+        k = self.mome_kernel
+        bt = params["block_table"]
+        seqlens = params["cache_seqlens"]
+        out = torch.empty_like(x)
+        for b in range(x.shape[0]):
+            key = (site, int(bt[b, 0]))
+            prev = self._conv_state.get(key) if int(seqlens[b]) > 0 else None
+            seq = torch.cat((prev, x[b]), dim = 0) if prev is not None else x[b]
+            y = _mome_conv(seq, weight, k)
+            out[b] = y[seq.shape[0] - x.shape[1]:]
+            self._conv_state[key] = seq[-(k - 1):].clone()
+        if len(self._conv_state) > 4096:
+            self._conv_state.clear()
+        return out
+
+    @override
+    def _fwd_paged(self, x, params):
+        # Pangu flavor of the paged path: MoME convs run through ring state,
+        # learned sinks merge into the flash output by logsumexp, DSA layers
+        # attend dense over the cache (sliding_window is None for them)
+        from flash_attn import flash_attn_with_kvcache
+        from ...cache import Cache, CacheLayer
+        bsz, q_len, hidden = x.shape
+        nope, rope_d, v_dim = self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim
+
+        q_lora = self.q_a_proj.forward(x, params)[..., : self.q_lora_rank]
+        if self.use_mome:
+            q_lora = self._conv_ring("q", q_lora, self.conv_qa, params)
+        q_lora = _rms_std(q_lora, self.q_a_norm_w, self.rms_norm_eps)
+        q = self.q_b_proj.forward(q_lora, params)[..., : self.num_heads * self.qk_head_dim]
+        q = q.view(bsz, q_len, self.num_heads, self.qk_head_dim)
+        q_nope, q_pe = torch.split(q, [nope, rope_d], dim = -1)
+
+        kv = self.kv_a_proj.forward(x, params)[..., : self.kv_lora_rank + rope_d]
+        k_latent, k_pe = torch.split(kv, [self.kv_lora_rank, rope_d], dim = -1)
+        if self.use_mome:
+            k_latent = self._conv_ring("kv", k_latent, self.conv_ckv, params)
+        norm = _rms_kvc if self.kv_norm_dtype_mul else _rms_std
+        k_lat_n = norm(k_latent, self.kv_a_norm_w, self.rms_norm_eps)
+        kv_up = self.kv_b_proj.forward(k_lat_n, {})[..., : self.num_heads * (nope + v_dim)]
+        kv_up = kv_up.view(bsz, q_len, self.num_heads, nope + v_dim)
+        k_nope, v = torch.split(kv_up, [nope, v_dim], dim = -1)
+
+        cache_seqlens = get_for_device(params, "cache_seqlens", x.device)
+        block_table = get_for_device(params, "block_table", x.device)
+        max_pos = int(cache_seqlens.max().item()) + q_len
+        cos, sin = self._cos_sin(max_pos, x.device, q_pe.dtype)
+        pos = cache_seqlens.long().unsqueeze(1) + torch.arange(q_len, device = x.device).unsqueeze(0)
+        cos_q = cos[pos].unsqueeze(2)
+        sin_q = sin[pos].unsqueeze(2)
+        q_pe = ((q_pe.float() * cos_q.float()) + (_rotate_half(q_pe.float()) * sin_q.float())).to(q.dtype)
+        cos_k = cos[pos].to(k_pe.dtype)
+        sin_k = sin[pos].to(k_pe.dtype)
+        k_pe = (k_pe * cos_k) + (_rotate_half(k_pe) * sin_k)
+
+        q = torch.cat((q_nope, q_pe), dim = -1)
+        k = torch.cat((k_nope, k_pe.unsqueeze(2).expand(-1, -1, self.num_heads, -1)), dim = -1)
+        v = F.pad(v, (0, self.qk_head_dim - v_dim))
+
+        cache = params.get("cache")
+        instance = params.get("layer_instance")
+        if isinstance(cache, CacheLayer):
+            k_cache, v_cache = cache.get_kv(cache_seqlens, block_table, self.sliding_window)
+        else:
+            k_cache, v_cache = cache.get_layer(self.layer_idx, cache_seqlens, block_table, self.sliding_window, instance)
+        window = (-1, -1) if self.sliding_window in (None, -1) else (self.sliding_window, 0)
+        o, lse = flash_attn_with_kvcache(
+            q = q.contiguous(),
+            k_cache = k_cache,
+            v_cache = v_cache,
+            k = k.contiguous(),
+            v = v.contiguous(),
+            block_table = block_table,
+            cache_seqlens = cache_seqlens,
+            causal = True,
+            softmax_scale = self.scaling,
+            window_size = window,
+            return_softmax_lse = True,
+        )
+        if isinstance(cache, CacheLayer):
+            cache.update_kv(cache_seqlens, block_table, k_cache, v_cache, q_len)
+        else:
+            cache.update_layer(self.layer_idx, cache_seqlens, block_table, k_cache, v_cache, q_len, instance)
+
+        if self.sink_count > 0:
+            sink_k, sink_v = self._sink_kv()
+            scores = torch.einsum("bqhd,hsd->bqhs", q.float(), sink_k) * self.scaling
+            lse_s = torch.logsumexp(scores, dim = -1)
+            o_s = torch.einsum("bqhs,hsv->bqhv", torch.softmax(scores, dim = -1), sink_v)
+            lse_c = lse.permute(0, 2, 1)
+            m = torch.maximum(lse_c, lse_s)
+            w_c = torch.exp(lse_c - m).unsqueeze(-1)
+            w_s = torch.exp(lse_s - m).unsqueeze(-1)
+            o = ((o.float() * w_c + o_s * w_s) / (w_c + w_s)).to(x.dtype)
+
+        o = o[..., : v_dim].reshape(bsz, q_len, self.num_heads * v_dim)
+        if self.use_mome:
+            o = self._conv_ring("o", o, self.conv_o, params)
+        return self.o_proj.forward(o, params)[..., : hidden]
+
     def extra_kv(self):
         if self.sink_count == 0:
             return None
@@ -269,7 +396,8 @@ class PanguDecoderBlock(Module):
     def forward(self, x, params, out_dtype = None):
         n, h = self.num_stream, self.hidden_size
         bsz, seq_len, dim = x.shape
-        assert bsz == 1, "openpangu_v2 Phase 1 runs batch size 1"
+        paged = params.get("cache") is not None
+        assert bsz == 1 or paged, "openpangu_v2 batch > 1 needs a paged cache"
         if x.dtype != torch.half:
             x = x.half()
         if dim == h:
@@ -280,7 +408,10 @@ class PanguDecoderBlock(Module):
         residual = x
         y, h_post, h_res = self.attn_mhc.mhc_pre(x)
         y = self.input_norm.forward(y, params, out_dtype = torch.half)
-        y = self.attn.forward(y, params)
+        if paged:
+            y = self.attn.forward(y.view(bsz, seq_len, h), params).reshape(bsz * seq_len, h)
+        else:
+            y = self.attn.forward(y, params)
         y = self.post_attn_norm.forward(y, params, out_dtype = torch.half)
         h_res = self.attn_mhc.mhc_sinkhorn(h_res)
         x = self.attn_mhc.mhc_post(y, h_post, residual, h_res)

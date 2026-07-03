@@ -512,7 +512,8 @@ class Generator:
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
 
-        # Greedy sample num_draft_tokens batched tokens
+        # Greedy sample num_draft_tokens batched tokens. mtp_step lets models
+        # with per-depth draft heads route each step to its trained head
         for idx in range(self.num_draft_tokens):
             params = {
                 "target_hidden": temp_hidden,
@@ -520,6 +521,7 @@ class Generator:
                 "block_table": block_index,
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens,
+                "mtp_step": idx,
             }
             batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]

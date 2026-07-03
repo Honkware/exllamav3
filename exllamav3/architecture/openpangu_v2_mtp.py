@@ -181,6 +181,20 @@ class OpenPanguV2MTPModel(Model):
         raise NotImplementedError("MTP draft model does not have its own chat template")
 
 
+    @override
+    def prefill(self, input_ids: torch.Tensor, params: dict | None = None):
+        # Refresh depth-0's cache for accepted positions. Deeper heads keep
+        # their drafting-time states; unwritten positions read back as zeros
+        if params is None:
+            params = {}
+        x = self.prepare_inputs(input_ids, params)
+        a, b = self.depth_slices[0]
+        for module in self.modules[a: b]:
+            params["layer_instance"] = 0
+            x = module.prepare_for_device(x, params)
+            x = module.forward(x, params)
+
+
     def attach_to(self, target):
         # Borrow the target's embedding and lm_head (per-depth embed_tokens and
         # shared_head.head are tied to the trunk's). The trunk exports the
